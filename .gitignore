@@ -1,0 +1,16 @@
+# Generated data — run nifty500_ohlcv.py to reproduce
+data/
+prices.duckdb
+nifty500_list.csv
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor
+.vscode/
