@@ -1,17 +1,16 @@
 """
-Download 10-year daily OHLCV for Nifty 500 -> partitioned Parquet -> DuckDB.
+Multi-market OHLCV downloader → partitioned Parquet → DuckDB / MotherDuck.
 
-Layout (Hive-partitioned, upgrade-friendly for more markets/symbols later):
-    data/market=IN/symbol=RELIANCE/year=2024/data.parquet
-    ...
+Markets:
+  IN  Nifty 500 (NSE)
+  US  S&P 500 (NYSE / NASDAQ)
 
-DuckDB (prices.duckdb) exposes a view `prices` over ALL parquet files,
-so you get one SQL database now and can just add more files later.
+Layout:  data/market={MKT}/symbol={SYM}/year={YEAR}/data.parquet
 
 Usage:
-    pip install yfinance pandas requests duckdb pyarrow
-    python nifty500_ohlcv.py            # download + (re)build view
-    python nifty500_ohlcv.py --view     # only rebuild the DuckDB view
+    pip install yfinance pandas requests duckdb pyarrow lxml
+    python pipeline.py            # all markets
+    python pipeline.py --view     # only rebuild DuckDB view
 """
 
 import os
@@ -23,67 +22,80 @@ import yfinance as yf
 import duckdb
 
 # ---------- config ----------
-MARKET = "IN"
 YEARS = 10
 START = (pd.Timestamp.today() - pd.DateOffset(years=YEARS)).strftime("%Y-%m-%d")
 END = pd.Timestamp.today().strftime("%Y-%m-%d")
 DATA_DIR = "data"
 DB_PATH = "prices.duckdb"
-LIST_CSV = "nifty500_list.csv"
 SLEEP = 1.0
-NSE_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
 # ----------------------------
 
 
 def get_nifty500_symbols():
-    """Fetch (and cache) Nifty 500 constituents. Returns list of NSE symbols."""
-    if not os.path.exists(LIST_CSV):
+    list_csv = "nifty500_list.csv"
+    nse_url = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
+    if not os.path.exists(list_csv):
         s = requests.Session()
         s.headers.update({"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US"})
-        s.get("https://www.nseindia.com", timeout=15)      # set cookies
-        r = s.get(NSE_URL, timeout=15)
+        s.get("https://www.nseindia.com", timeout=15)
+        r = s.get(nse_url, timeout=15)
         r.raise_for_status()
-        with open(LIST_CSV, "wb") as f:
+        with open(list_csv, "wb") as f:
             f.write(r.content)
-    df = pd.read_csv(LIST_CSV)
+    df = pd.read_csv(list_csv)
     return [str(sym).strip() for sym in df["Symbol"]]
 
 
-def write_partitions(symbol, df):
-    """Write one symbol's OHLCV as year-partitioned parquet."""
-    # newer yfinance returns MultiIndex columns like ('Close','SYM.NS'); flatten them
+def get_sp500_symbols():
+    list_csv = "sp500_list.csv"
+    if not os.path.exists(list_csv):
+        df = pd.read_html(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+        )[0]
+        df.to_csv(list_csv, index=False)
+    df = pd.read_csv(list_csv)
+    return [str(sym).strip() for sym in df["Symbol"]]
+
+
+MARKETS = {
+    "IN": {
+        "get_symbols": get_nifty500_symbols,
+        "ticker_fn": lambda sym: f"{sym}.NS",
+    },
+    "US": {
+        "get_symbols": get_sp500_symbols,
+        "ticker_fn": lambda sym: sym.replace(".", "-"),  # BRK.B → BRK-B on Yahoo Finance
+    },
+}
+
+
+def write_partitions(market, symbol, df):
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df = df.reset_index()
-    df.columns = [str(c).lower() for c in df.columns]  # date, open, high, low, close, volume
+    df.columns = [str(c).lower() for c in df.columns]
     df["year"] = pd.to_datetime(df["date"]).dt.year
     for year, g in df.groupby("year"):
-        out = os.path.join(
-            DATA_DIR, f"market={MARKET}", f"symbol={symbol}", f"year={year}"
-        )
+        out = os.path.join(DATA_DIR, f"market={market}", f"symbol={symbol}", f"year={year}")
         os.makedirs(out, exist_ok=True)
-        g.drop(columns=["year"]).to_parquet(
-            os.path.join(out, "data.parquet"), index=False
-        )
+        g.drop(columns=["year"]).to_parquet(os.path.join(out, "data.parquet"), index=False)
 
 
-def download_all(symbols):
+def download_all(market, symbols, ticker_fn):
     done, failed = [], []
     for i, sym in enumerate(symbols, 1):
-        marker = os.path.join(DATA_DIR, f"market={MARKET}", f"symbol={sym}")
-        if os.path.isdir(marker):                     # resume: skip finished symbols
+        marker = os.path.join(DATA_DIR, f"market={market}", f"symbol={sym}")
+        if os.path.isdir(marker):
             done.append(sym)
             continue
         try:
-            df = yf.download(
-                f"{sym}.NS", start=START, end=END,
-                auto_adjust=True, progress=False,
-            )
+            ticker = ticker_fn(sym)
+            df = yf.download(ticker, start=START, end=END, auto_adjust=True, progress=False)
             if df.empty:
                 failed.append(sym)
                 print(f"[{i}/{len(symbols)}] {sym}: EMPTY")
             else:
-                write_partitions(sym, df)
+                write_partitions(market, sym, df)
                 done.append(sym)
                 print(f"[{i}/{len(symbols)}] {sym}: {len(df)} rows")
         except Exception as e:
@@ -94,7 +106,6 @@ def download_all(symbols):
 
 
 def build_view():
-    """(Re)create a DuckDB view over every parquet file under DATA_DIR."""
     con = duckdb.connect(DB_PATH)
     glob = f"{DATA_DIR}/**/*.parquet"
     con.execute(f"""
@@ -105,12 +116,10 @@ def build_view():
     mkts = con.execute("SELECT count(DISTINCT market) FROM prices").fetchone()[0]
     syms = con.execute("SELECT count(DISTINCT symbol) FROM prices").fetchone()[0]
     con.close()
-    print(f"\nDuckDB '{DB_PATH}': view 'prices' -> {n:,} rows | "
-          f"{syms} symbols | {mkts} market(s)")
+    print(f"\nDuckDB '{DB_PATH}': view 'prices' -> {n:,} rows | {syms} symbols | {mkts} market(s)")
 
 
 def load_to_motherduck():
-    """Replace the MotherDuck 'prices' table with current local parquet data."""
     token = os.environ.get("motherduck_token")
     if not token:
         return
@@ -133,11 +142,13 @@ if __name__ == "__main__":
         build_view()
         sys.exit(0)
 
-    symbols = get_nifty500_symbols()
-    print(f"Universe: {len(symbols)} symbols | {START} -> {END}")
-    done, failed = download_all(symbols)
-    print(f"\nDownloaded/present: {len(done)}  Failed: {len(failed)}")
-    if failed:
-        print("Failed:", ", ".join(failed))
+    for market, cfg in MARKETS.items():
+        symbols = cfg["get_symbols"]()
+        print(f"\n=== {market}: {len(symbols)} symbols | {START} -> {END} ===")
+        done, failed = download_all(market, symbols, cfg["ticker_fn"])
+        print(f"Downloaded/present: {len(done)}  Failed: {len(failed)}")
+        if failed:
+            print("Failed:", ", ".join(failed))
+
     build_view()
     load_to_motherduck()

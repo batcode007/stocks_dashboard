@@ -1,7 +1,8 @@
-# Generated data — run nifty500_ohlcv.py to reproduce
+# Generated data — run pipeline.py to reproduce
 data/
 prices.duckdb
 nifty500_list.csv
+sp500_list.csv
 
 # macOS
 .DS_Store
