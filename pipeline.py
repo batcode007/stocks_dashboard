@@ -16,6 +16,7 @@ Usage:
 import os
 import sys
 import time
+from io import StringIO
 import requests
 import pandas as pd
 import yfinance as yf
@@ -49,9 +50,13 @@ def get_nifty500_symbols():
 def get_sp500_symbols():
     list_csv = "sp500_list.csv"
     if not os.path.exists(list_csv):
-        df = pd.read_html(
-            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-        )[0]
+        r = requests.get(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+            headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        df = pd.read_html(StringIO(r.text))[0]
         df.to_csv(list_csv, index=False)
     df = pd.read_csv(list_csv)
     return [str(sym).strip() for sym in df["Symbol"]]
@@ -125,13 +130,14 @@ def load_to_motherduck():
         return
     print("\nLoading to MotherDuck...")
     glob = f"{DATA_DIR}/**/*.parquet"
-    con = duckdb.connect("md:stocks")
+    con = duckdb.connect("md:")
+    con.execute("CREATE DATABASE IF NOT EXISTS stocks")
     con.execute(f"""
-        CREATE OR REPLACE TABLE prices AS
+        CREATE OR REPLACE TABLE stocks.prices AS
         SELECT * FROM read_parquet('{glob}', hive_partitioning = true)
     """)
-    n = con.execute("SELECT count(*) FROM prices").fetchone()[0]
-    syms = con.execute("SELECT count(DISTINCT symbol) FROM prices").fetchone()[0]
+    n = con.execute("SELECT count(*) FROM stocks.prices").fetchone()[0]
+    syms = con.execute("SELECT count(DISTINCT symbol) FROM stocks.prices").fetchone()[0]
     con.close()
     print(f"MotherDuck 'stocks.prices': {n:,} rows | {syms} symbols")
 
